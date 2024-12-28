@@ -10,7 +10,7 @@ from train_eval import train_one_epoch, evaluate_model
 
 
 if __name__=="__main__":
-    data_dir = 'D:\Data\Dataset\coco_2017'
+    data_dir = '/hy-tmp/COCO2017'
     os.makedirs("./logs",exist_ok=True)
 
 

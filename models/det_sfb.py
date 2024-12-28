@@ -12,14 +12,13 @@ from .ssd import build_ssd_custom
 class DetSFB(nn.Module):
     """ Detector trained with Supervisor's FeedBacks
     """
-    def __init__(self, det_net_dict, sup_net_dict, roi_size=(32, 32), score_threshold=0.5):
+    def __init__(self, det_net_dict, sup_net_dict, roi_size=(32, 32)):
         super().__init__()
         self.det_net_dict = det_net_dict
         self.sup_net_dict = sup_net_dict
         self.det_net = build_det_net(det_net_dict)
         self.sup_net = build_sup_net(sup_net_dict)
         self.roi_size = roi_size
-        self.score_threshold = score_threshold
 
     def forward(
             self, images:List[Tensor], targets:List[Dict]=None
@@ -32,8 +31,9 @@ class DetSFB(nn.Module):
                 boxes = output['boxes']
                 labels = output['labels']
                 scores = output['scores']
+                score_threshold = sorted(list(scores))[int(0.5*len(scores))]
                 for box, label, score in zip(boxes, labels, scores):
-                    if score > self.score_threshold:
+                    if score > score_threshold:
                         rois.append(self.roi_align(image, box, size=self.roi_size))
                         roi_labels.append(label)
             rois = torch.stack(rois)
@@ -66,16 +66,31 @@ class DetSFB(nn.Module):
             return det_outputs
         
     def roi_align(self, image: Tensor, box: Tensor, size: Union[List, Tuple]=None) -> Tensor:
-        x_min, y_min, x_max, y_max = box.unbind()
-        x_min = torch.clamp(x_min.long(), min=0).to(torch.int8)
-        y_min = torch.clamp(y_min.long(), min=0).to(torch.int8)
-        x_max = torch.clamp(x_max.long(), max=image.shape[1]).to(torch.int8)
-        y_max = torch.clamp(y_max.long(), max=image.shape[0]).to(torch.int8)
+        x_min, y_min, x_max, y_max = box
+        height, width = image.shape[1], image.shape[2]
 
-        roi = image[y_min:y_max, x_min:x_max]
+        x_min = torch.clamp(x_min, min=0, max=image.shape[1]-1)
+        y_min = torch.clamp(y_min, min=0, max=image.shape[0]-1)
+        x_max = torch.clamp(x_max, min=int(x_min)+1, max=image.shape[1])
+        y_max = torch.clamp(y_max, min=int(y_min)+1, max=image.shape[0])
+
+        # 将框坐标转换为 [-1, 1] 范围的归一化坐标
+        grid_x_min = 2 * (x_min / width) - 1
+        grid_y_min = 2 * (y_min / height) - 1
+        grid_x_max = 2 * (x_max / width) - 1
+        grid_y_max = 2 * (y_max / height) - 1
+
+        # 创建一个 1x2x2x2 的采样网格，表示裁剪区域的坐标 (注意: `grid_sample` 需要 N x H x W x 2 格式)
+        grid = torch.tensor([[[[grid_x_min, grid_y_min], [grid_x_max, grid_y_min]],
+                            [[grid_x_min, grid_y_max], [grid_x_max, grid_y_max]]]],
+                            dtype=torch.float32,
+                            device=image.device)
+
+        # 通过 grid_sample 函数进行裁剪
+        cropped_image = F.grid_sample(image.unsqueeze(0), grid, align_corners=True)[0]
         if size is not None:
-            roi = trans_F.resize(roi, size)
-        return roi
+            cropped_image = trans_F.resize(cropped_image, size)
+        return cropped_image
 
     def loss_det(self, sup_outputs: Tensor, roi_labels: Tensor) -> Tensor:
         sup_labels, sup_scores = sup_outputs
@@ -85,6 +100,7 @@ class DetSFB(nn.Module):
     
     def loss_sup(self, sup_outputs: Tuple[Tensor, Tensor], roi_labels_gt: Tensor) -> Tensor:
         sup_labels, sup_scores = sup_outputs
+        sup_labels = sup_labels[:len(roi_labels_gt)]
         sup_scores_pos =sup_scores[:len(roi_labels_gt)]
         sup_scores_neg = sup_scores[len(roi_labels_gt):]
         loss_adv = -torch.mean(torch.log(sup_scores_pos))-torch.mean(torch.log(1-sup_scores_neg))

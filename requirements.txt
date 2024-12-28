@@ -1,0 +1,4 @@
+pycocotools
+numpy
+albumentations
+pillow

@@ -3,10 +3,12 @@ from typing import List, Dict, Optional, Tuple
 
 import torch
 from torch import Tensor
+from torch.nn import functional as F
 from torchvision.models.detection.ssd import SSD, _vgg_extractor
 from torchvision.models.detection.anchor_utils import DefaultBoxGenerator
 from torchvision.ops import boxes as box_ops
 from torchvision.models.vgg import vgg16
+from torchvision.models.detection import _utils as det_utils
 
 
 class SSD_Custom(SSD):
@@ -88,6 +90,61 @@ class SSD_Custom(SSD):
 
             return detections
         
+    def postprocess_detections(
+        self, head_outputs: Dict[str, Tensor], image_anchors: List[Tensor], image_shapes: List[Tuple[int, int]]
+    ) -> List[Dict[str, Tensor]]:
+        bbox_regression = head_outputs["bbox_regression"]
+        pred_scores = F.softmax(head_outputs["cls_logits"], dim=-1)
+        # bbox_regression: [batch_size, num_boxes, 4]
+        # pred_scores: [batch_size, num_boxes, num_classes]
+
+        num_classes = pred_scores.size(-1)
+        device = pred_scores.device
+
+        detections: List[Dict[str, Tensor]] = []
+
+        for boxes, scores, anchors, image_shape in zip(bbox_regression, pred_scores, image_anchors, image_shapes):
+            # boxes: [num_boxes, 4]
+            # scores: [num_boxes, num_classes]
+            boxes = self.box_coder.decode_single(boxes, anchors)
+            boxes = box_ops.clip_boxes_to_image(boxes, image_shape)
+
+            image_boxes = []
+            image_scores = []
+            image_labels = []
+            for label in range(1, num_classes):
+                score = scores[:, label]
+
+                keep_idxs = score > self.score_thresh
+                score = score[keep_idxs]
+                box = boxes[keep_idxs]
+
+                # keep only topk scoring predictions
+                num_topk = det_utils._topk_min(score, self.topk_candidates, 0)
+                score, idxs = score.topk(num_topk)
+                box = box[idxs]
+
+                image_boxes.append(box)
+                image_scores.append(score)
+                image_labels.append(torch.full_like(score, fill_value=label, dtype=torch.int64, device=device))
+
+            image_boxes = torch.cat(image_boxes, dim=0)
+            image_scores = torch.cat(image_scores, dim=0)
+            image_labels = torch.cat(image_labels, dim=0)
+
+            # non-maximum suppression
+            keep = box_ops.batched_nms(image_boxes, image_scores, image_labels, self.nms_thresh)
+            keep = keep[: self.detections_per_img]
+
+            detections.append(
+                {
+                    "boxes": image_boxes[keep],
+                    "scores": image_scores[keep],
+                    "labels": image_labels[keep],
+                }
+            )
+        return detections
+    
 
 def build_ssd_custom(num_classes:int) -> SSD_Custom:
     # Use custom backbones more appropriate for SSD
